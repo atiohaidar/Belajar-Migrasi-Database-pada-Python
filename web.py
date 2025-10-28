@@ -5,41 +5,59 @@ from flask import jsonify, render_template_string, request
 from app import Ruangan, RuanganUser, User, app, db
 
 
-def serialize_user(
-    user: User,
-    assignments: dict[int, int | None],
-    room_lookup: dict[int, str],
-) -> dict[str, str | int | None]:
-    room_id = assignments.get(user.id)
+def serialize_user(user: User) -> dict[str, str | int]:
     return {
         "id": user.id,
         "name": user.name,
         "email": user.email,
-        "room_id": room_id,
-        "room_name": room_lookup.get(room_id),
     }
 
 
-def build_board_payload() -> dict[str, list[dict[str, str | int | None]]]:
+def build_board_payload() -> dict[str, list[dict[str, str | int]]]:
     rooms = Ruangan.query.order_by(Ruangan.id).all()
     users = User.query.order_by(User.id).all()
-    assignments = {rel.user_id: rel.ruangan_id for rel in RuanganUser.query.all()}
-    room_lookup = {room.id: room.name for room in rooms}
 
-    palette = [serialize_user(user, assignments, room_lookup) for user in users]
+    palette = [serialize_user(user) for user in users]
 
-    room_payload = []
-    for room in rooms:
-        room_users = [user for user in palette if user["room_id"] == room.id]
-        room_payload.append({
-            "id": room.id,
-            "name": room.name,
-            "users": room_users,
-        })
+    assignment_rows = (
+        db.session.query(
+            RuanganUser.id.label("assignment_id"),
+            RuanganUser.user_id,
+            RuanganUser.ruangan_id,
+            User.name,
+            User.email,
+        )
+        .join(User, User.id == RuanganUser.user_id)
+        .all()
+    )
+
+    room_map: dict[int, dict[str, object]] = {
+        room.id: {"id": room.id, "name": room.name, "users": []}
+        for room in rooms
+    }
+
+    assigned_user_ids: set[int] = set()
+
+    for row in assignment_rows:
+        assigned_user_ids.add(row.user_id)
+        room_entry = room_map.get(row.ruangan_id)
+        if room_entry is None:
+            continue
+        room_entry["users"].append(
+            {
+                "assignment_id": row.assignment_id,
+                "user_id": row.user_id,
+                "name": row.name,
+                "email": row.email,
+            }
+        )
+
+    unassigned = [serialize_user(user) for user in users if user.id not in assigned_user_ids]
 
     return {
         "palette": palette,
-        "rooms": room_payload,
+        "unassigned": unassigned,
+        "rooms": list(room_map.values()),
     }
 
 
@@ -73,23 +91,44 @@ def index():
                     padding: 24px;
                     background: #111827;
                     color: #f9fafb;
-                    text-align: center;
                     box-shadow: 0 4px 20px rgba(0, 0, 0, 0.12);
                 }
-                header h1 {
+                .header-content {
+                    display: flex;
+                    justify-content: space-between;
+                    align-items: center;
+                    gap: 16px;
+                    flex-wrap: wrap;
+                    text-align: left;
+                }
+                .header-content h1 {
                     margin: 0;
                     font-size: 2rem;
                     font-weight: 600;
                 }
-                header p {
+                .header-content p {
                     margin-top: 8px;
                     color: rgba(249, 250, 251, 0.74);
+                }
+                .primary-button {
+                    padding: 12px 18px;
+                    border-radius: 12px;
+                    border: none;
+                    font-weight: 600;
+                    background: linear-gradient(135deg, #22d3ee, #3b82f6);
+                    color: #0f172a;
+                    cursor: pointer;
+                    transition: transform 120ms ease, box-shadow 120ms ease;
+                }
+                .primary-button:hover {
+                    transform: translateY(-1px);
+                    box-shadow: 0 12px 28px rgba(34, 211, 238, 0.35);
                 }
                 main {
                     flex: 1;
                     padding: 24px;
                     display: grid;
-                    grid-template-columns: 320px 240px 1fr;
+                    grid-template-columns: minmax(240px, 280px) 1fr;
                     gap: 24px;
                 }
                 @media (max-width: 1100px) {
@@ -232,35 +271,104 @@ def index():
                 .palette-panel h2 {
                     margin: 0;
                 }
+                .modal-backdrop {
+                    position: fixed;
+                    inset: 0;
+                    background: rgba(15, 23, 42, 0.45);
+                    backdrop-filter: blur(4px);
+                    opacity: 0;
+                    pointer-events: none;
+                    transition: opacity 160ms ease;
+                    z-index: 200;
+                }
+                .modal-backdrop.visible {
+                    opacity: 1;
+                    pointer-events: auto;
+                }
+                .modal {
+                    position: fixed;
+                    inset: 50% auto auto 50%;
+                    transform: translate(-50%, -50%) scale(0.96);
+                    background: #ffffff;
+                    border-radius: 18px;
+                    box-shadow: 0 25px 60px rgba(15, 23, 42, 0.25);
+                    width: min(640px, calc(100% - 32px));
+                    padding: 28px;
+                    opacity: 0;
+                    pointer-events: none;
+                    transition: opacity 160ms ease, transform 160ms ease;
+                    z-index: 210;
+                }
+                .modal.visible {
+                    opacity: 1;
+                    pointer-events: auto;
+                    transform: translate(-50%, -50%) scale(1);
+                }
+                .modal header {
+                    background: none;
+                    color: inherit;
+                    box-shadow: none;
+                    padding: 0;
+                    margin-bottom: 16px;
+                }
+                .modal-content {
+                    display: grid;
+                    gap: 20px;
+                }
+                .modal-close {
+                    position: absolute;
+                    top: 16px;
+                    right: 16px;
+                    width: 32px;
+                    height: 32px;
+                    border-radius: 50%;
+                    background: rgba(148, 163, 184, 0.2);
+                    color: #0f172a;
+                    font-size: 1.2rem;
+                    display: grid;
+                    place-items: center;
+                    border: none;
+                    cursor: pointer;
+                }
+                .modal-forms {
+                    display: grid;
+                    gap: 24px;
+                    grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+                }
+                .modal-forms form {
+                    background: rgba(241, 245, 249, 0.6);
+                    padding: 16px;
+                    border-radius: 14px;
+                    display: grid;
+                    gap: 14px;
+                }
+                .modal-forms label span {
+                    font-size: 0.9rem;
+                    color: #475569;
+                    display: block;
+                    margin-bottom: 4px;
+                }
+                .modal-forms input {
+                    width: 100%;
+                    padding: 10px 12px;
+                    border-radius: 10px;
+                    border: 1px solid rgba(148, 163, 184, 0.5);
+                    background: #ffffff;
+                    font: inherit;
+                }
             </style>
         </head>
         <body>
             <header>
-                <h1>Papan Manajemen Ruangan</h1>
-                <p>Seret dan jatuhkan pengguna antar ruangan layaknya bermain game.</p>
+                <div class="header-content">
+                    <div>
+                        <h1>Papan Manajemen Ruangan</h1>
+                        <p>Seret dan jatuhkan pengguna antar ruangan layaknya bermain game.</p>
+                    </div>
+                    <button class="primary-button" id="open-modal">Tambah Data</button>
+                </div>
             </header>
             <main>
-                <aside class="panel">
-                    <h2>Tambah Data</h2>
-                    <form id="new-user-form">
-                        <label>
-                            <span>Nama Pengguna</span>
-                            <input name="name" placeholder="Misal: Sinta" required>
-                        </label>
-                        <label>
-                            <span>Email</span>
-                            <input name="email" type="email" placeholder="sinta@example.com" required>
-                        </label>
-                        <button type="submit">Tambah Pengguna</button>
-                    </form>
-                    <form id="new-room-form">
-                        <label>
-                            <span>Nama Ruangan</span>
-                            <input name="name" placeholder="Misal: Studio Kreatif" required>
-                        </label>
-                        <button type="submit">Tambah Ruangan</button>
-                    </form>
-                </aside>
                 <section class="panel palette-panel">
                     <h2>Daftar Pengguna</h2>
                     <p style="margin:0;color:#64748b;font-size:0.85rem;">Semua pengguna tersedia. Seret ke ruangan mana pun.</p>
@@ -274,11 +382,44 @@ def index():
                     <div id="board"></div>
                 </section>
             </main>
+            <div class="modal-backdrop" id="modal-backdrop"></div>
+            <div class="modal" id="modal" role="dialog" aria-modal="true" aria-labelledby="modal-title">
+                <div class="modal-content">
+                    <button class="modal-close" id="close-modal" aria-label="Tutup">&times;</button>
+                    <h2 id="modal-title" style="margin:0;">Tambah Data</h2>
+                    <div class="modal-forms">
+                        <form id="new-user-form">
+                            <h3 style="margin:0;">Pengguna Baru</h3>
+                            <label>
+                                <span>Nama Pengguna</span>
+                                <input name="name" placeholder="Misal: Sinta" required>
+                            </label>
+                            <label>
+                                <span>Email</span>
+                                <input name="email" type="email" placeholder="sinta@example.com" required>
+                            </label>
+                            <button type="submit">Simpan Pengguna</button>
+                        </form>
+                        <form id="new-room-form">
+                            <h3 style="margin:0;">Ruangan Baru</h3>
+                            <label>
+                                <span>Nama Ruangan</span>
+                                <input name="name" placeholder="Misal: Studio Kreatif" required>
+                            </label>
+                            <button type="submit">Simpan Ruangan</button>
+                        </form>
+                    </div>
+                </div>
+            </div>
             <script>
                 const boardEl = document.getElementById('board');
                 const paletteList = document.getElementById('palette');
                 const userForm = document.getElementById('new-user-form');
                 const roomForm = document.getElementById('new-room-form');
+                const openModalBtn = document.getElementById('open-modal');
+                const closeModalBtn = document.getElementById('close-modal');
+                const modalEl = document.getElementById('modal');
+                const modalBackdrop = document.getElementById('modal-backdrop');
 
                 async function fetchBoard() {
                     const response = await fetch('/api/board');
@@ -289,13 +430,25 @@ def index():
                     renderBoard(data);
                 }
 
+                function openModal() {
+                    modalEl.classList.add('visible');
+                    modalBackdrop.classList.add('visible');
+                    document.body.classList.add('modal-open');
+                }
+
+                function closeModal() {
+                    modalEl.classList.remove('visible');
+                    modalBackdrop.classList.remove('visible');
+                    document.body.classList.remove('modal-open');
+                }
+
                 function renderBoard(data) {
                     boardEl.innerHTML = '';
                     paletteList.innerHTML = '';
                     data.palette.forEach(user => {
                         paletteList.appendChild(createUserCard(user));
                     });
-                    boardEl.appendChild(createColumn('Belum Ter-assign', 'unassigned', data.palette.filter(user => user.room_id === null)));
+                    boardEl.appendChild(createColumn('Belum Ter-assign', 'unassigned', data.unassigned));
                     data.rooms.forEach(room => {
                         boardEl.appendChild(createColumn(room.name, `room-${room.id}`, room.users, room.id));
                     });
@@ -313,7 +466,7 @@ def index():
                     list.dataset.roomId = roomId ? String(roomId) : '';
 
                     users.forEach(user => {
-                        list.appendChild(createUserCard(user));
+                        list.appendChild(createUserCard(user, user.assignment_id ?? null));
                     });
 
                     column.appendChild(heading);
@@ -321,10 +474,20 @@ def index():
                     return column;
                 }
 
-                function createUserCard(user) {
+                function createUserCard(user, assignmentId = null) {
                     const item = document.createElement('li');
                     item.className = 'user-card';
-                    item.dataset.userId = user.id;
+                    const userIdValue = user.id ?? user.user_id;
+                    if (userIdValue == null) {
+                        console.warn('User ID tidak ditemukan pada data kartu:', user);
+                        return item;
+                    }
+                    item.dataset.userId = userIdValue;
+                    if (assignmentId) {
+                        item.dataset.assignmentId = assignmentId;
+                    } else {
+                        delete item.dataset.assignmentId;
+                    }
                     const nameEl = document.createElement('strong');
                     nameEl.textContent = user.name;
                     const emailEl = document.createElement('span');
@@ -336,8 +499,16 @@ def index():
 
                 function initDragAndDrop() {
                     document.querySelectorAll('.user-list').forEach(list => {
+                        const existing = Sortable.get(list);
+                        if (existing) {
+                            existing.destroy();
+                        }
+
+                        const isPalette = list.id === 'palette';
+
                         Sortable.create(list, {
-                            group: 'users',
+                            group: isPalette ? { name: 'users', pull: 'clone', put: false } : { name: 'users', pull: true, put: true },
+                            sort: !isPalette,
                             animation: 150,
                             ghostClass: 'dragging',
                             onChoose: (evt) => {
@@ -359,14 +530,32 @@ def index():
 
                 async function handleDrop(evt) {
                     const userId = Number(evt.item.dataset.userId);
-                    const targetRoom = evt.to.dataset.roomId;
+                    const assignmentIdAttr = evt.item.dataset.assignmentId;
+                    const assignmentId = assignmentIdAttr ? Number(assignmentIdAttr) : null;
+                    const targetRoomAttr = evt.to.dataset.roomId;
+                    const targetRoom = targetRoomAttr ? Number(targetRoomAttr) : null;
+
+                    const fromPalette = evt.from.id === 'palette';
+                    const toUnassigned = evt.to.id === 'unassigned';
+
+                    if (fromPalette && toUnassigned) {
+                        evt.item.remove();
+                        return;
+                    }
+
+                    if (!assignmentId && targetRoom === null) {
+                        evt.item.remove();
+                        return;
+                    }
+
                     try {
                         const response = await fetch('/api/assign', {
                             method: 'POST',
                             headers: { 'Content-Type': 'application/json' },
                             body: JSON.stringify({
                                 user_id: userId,
-                                ruangan_id: targetRoom ? Number(targetRoom) : null,
+                                ruangan_id: targetRoom,
+                                assignment_id: assignmentId,
                             }),
                         });
                         if (!response.ok) {
@@ -394,6 +583,24 @@ def index():
                     }, 2600);
                 }
 
+                openModalBtn.addEventListener('click', () => {
+                    openModal();
+                });
+
+                closeModalBtn.addEventListener('click', () => {
+                    closeModal();
+                });
+
+                modalBackdrop.addEventListener('click', () => {
+                    closeModal();
+                });
+
+                document.addEventListener('keydown', event => {
+                    if (event.key === 'Escape' && modalEl.classList.contains('visible')) {
+                        closeModal();
+                    }
+                });
+
                 userForm.addEventListener('submit', async event => {
                     event.preventDefault();
                     const formData = new FormData(userForm);
@@ -409,6 +616,7 @@ def index():
                             throw new Error(error.message || 'Gagal menambah pengguna.');
                         }
                         userForm.reset();
+                        closeModal();
                         await fetchBoard();
                         showToast('Pengguna baru ditambahkan.');
                     } catch (error) {
@@ -432,6 +640,7 @@ def index():
                             throw new Error(error.message || 'Gagal menambah ruangan.');
                         }
                         roomForm.reset();
+                        closeModal();
                         await fetchBoard();
                         showToast('Ruangan baru ditambahkan.');
                     } catch (error) {
@@ -461,6 +670,7 @@ def api_assign():
     data = request.get_json(silent=True) or {}
     user_id = data.get("user_id")
     room_id = data.get("ruangan_id")
+    assignment_id = data.get("assignment_id")
 
     if user_id is None:
         return jsonify({"message": "user_id wajib diisi"}), 400
@@ -469,20 +679,37 @@ def api_assign():
     if user is None:
         return jsonify({"message": "Pengguna tidak ditemukan"}), 404
 
-    room = None
-    if room_id is not None:
-        room = Ruangan.query.get(room_id)
-        if room is None:
-            return jsonify({"message": "Ruangan tidak ditemukan"}), 404
+    if assignment_id is not None:
+        assignment = RuanganUser.query.get(assignment_id)
+        if assignment is None:
+            return jsonify({"message": "Relasi tidak ditemukan"}), 404
 
-    # Hapus seluruh relasi lama user
-    RuanganUser.query.filter_by(user_id=user.id).delete()
+        if room_id is None:
+            db.session.delete(assignment)
+        else:
+            room = Ruangan.query.get(room_id)
+            if room is None:
+                return jsonify({"message": "Ruangan tidak ditemukan"}), 404
+            assignment.ruangan_id = room.id
+        db.session.commit()
+        return jsonify(build_board_payload())
 
-    if room_id is not None:
+    # assignment_id tidak disediakan -> buat relasi baru jika ada ruangan
+    if room_id is None:
+        return jsonify(build_board_payload())
+
+    room = Ruangan.query.get(room_id)
+    if room is None:
+        return jsonify({"message": "Ruangan tidak ditemukan"}), 404
+
+    existing = RuanganUser.query.filter_by(user_id=user.id, ruangan_id=room.id).first()
+    if existing is None:
         assignment = RuanganUser(user_id=user.id, ruangan_id=room.id)
         db.session.add(assignment)
+        db.session.commit()
+    else:
+        db.session.commit()
 
-    db.session.commit()
     return jsonify(build_board_payload())
 
 
